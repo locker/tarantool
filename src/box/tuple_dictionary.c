@@ -29,24 +29,22 @@
  * SUCH DAMAGE.
  */
 #include "tuple_dictionary.h"
+
+#include <assert.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
 #include "assoc.h"
 #include "error.h"
 #include "diag.h"
+#include "salad/grp_alloc.h"
+#include "trivia/util.h"
 
 #include "PMurHash.h"
 
 field_name_hash_f field_name_hash;
-
-/** Free names hash and its content. */
-static inline void
-tuple_dictionary_delete_hash(struct mh_strnu32_t *hash)
-{
-	while (mh_size(hash)) {
-		mh_int_t i = mh_first(hash);
-		mh_strnu32_del(hash, i, NULL);
-	}
-	mh_strnu32_delete(hash);
-}
 
 /** Free tuple dictionary and its content. */
 static inline void
@@ -54,7 +52,7 @@ tuple_dictionary_delete(struct tuple_dictionary *dict)
 {
 	assert(dict->refs == 0);
 	if (dict->hash != NULL) {
-		tuple_dictionary_delete_hash(dict->hash);
+		mh_strnu32_delete(dict->hash);
 		free(dict->names);
 	} else {
 		assert(dict->names == NULL);
@@ -95,49 +93,71 @@ tuple_dictionary_set_name(struct tuple_dictionary *dict, const char *name,
 	return 0;
 }
 
+/**
+ * Helper function that constructs a tuple dictionary from an array of field
+ * names. A pointer to a field name is supposed to be stored at offset
+ * name_data_offset in object of size name_data_objsize. This way we can use
+ * not only a plain string array as a source of field names, but also an array
+ * of container objects (e.g. field_def).
+ */
+static struct tuple_dictionary *
+tuple_dictionary_new_impl(const void *name_data, size_t name_data_offset,
+			  size_t name_data_objsize, uint32_t name_count)
+{
+	/*
+	 * Sic: We don't allocate dict and names from a continuous memory
+	 * block, because we need to swap names, see tuple_dictionary_swap().
+	 */
+	struct tuple_dictionary *dict = xmalloc(sizeof(*dict));
+	dict->refs = 1;
+	dict->name_count = name_count;
+	if (name_count == 0) {
+		dict->names = NULL;
+		dict->hash = NULL;
+		return dict;
+	}
+	struct grp_alloc all = grp_alloc_initializer();
+	grp_alloc_reserve_data(&all, sizeof(dict->names[0]) * name_count);
+	for (uint32_t i = 0; i < name_count; ++i) {
+		const char *const *name = name_data + i * name_data_objsize +
+					  name_data_offset;
+		grp_alloc_reserve_str0(&all, *name);
+	}
+	grp_alloc_use(&all, xmalloc(grp_alloc_size(&all)));
+	dict->names = grp_alloc_create_data(
+		&all, sizeof(dict->names[0]) * name_count);
+	dict->hash = mh_strnu32_new();
+	mh_strnu32_reserve(dict->hash, name_count, NULL);
+	for (uint32_t i = 0; i < name_count; ++i) {
+		const char *const *name = name_data + i * name_data_objsize +
+					  name_data_offset;
+		size_t len = strlen(*name);
+		dict->names[i] = grp_alloc_create_str(&all, *name, len);
+		if (tuple_dictionary_set_name(dict, dict->names[i],
+					      len, i) != 0) {
+			mh_strnu32_delete(dict->hash);
+			free(dict->names);
+			free(dict);
+			return NULL;
+		}
+	}
+	assert(grp_alloc_size(&all) == 0);
+	return dict;
+}
+
 struct tuple_dictionary *
 tuple_dictionary_new(const struct field_def *fields, uint32_t field_count)
 {
-	struct tuple_dictionary *dict =
-		(struct tuple_dictionary *)calloc(1, sizeof(*dict));
-	if (dict == NULL) {
-		diag_set(OutOfMemory, sizeof(*dict), "malloc",
-			 "dict");
-		return NULL;
-	}
-	dict->refs = 1;
-	dict->name_count = field_count;
-	if (field_count == 0)
-		return dict;
-	uint32_t names_offset = sizeof(dict->names[0]) * field_count;
-	uint32_t total = names_offset;
-	for (uint32_t i = 0; i < field_count; ++i)
-		total += strlen(fields[i].name) + 1;
-	dict->names = (char **) malloc(total);
-	if (dict->names == NULL) {
-		diag_set(OutOfMemory, total, "malloc", "dict->names");
-		goto err_memory;
-	}
-	dict->hash = mh_strnu32_new();
-	mh_strnu32_reserve(dict->hash, field_count, NULL);
-	char *pos = (char *) dict->names + names_offset;
-	for (uint32_t i = 0; i < field_count; ++i) {
-		int len = strlen(fields[i].name);
-		memcpy(pos, fields[i].name, len);
-		pos[len] = 0;
-		dict->names[i] = pos;
-		if (tuple_dictionary_set_name(dict, pos, len, i) != 0)
-			goto err_name;
-		pos += len + 1;
-	}
-	return dict;
+	return tuple_dictionary_new_impl(
+			fields, offsetof(struct field_def, name),
+			sizeof(struct field_def), field_count);
+}
 
-err_name:
-	tuple_dictionary_delete_hash(dict->hash);
-	free(dict->names);
-err_memory:
-	free(dict);
-	return NULL;
+struct tuple_dictionary *
+tuple_dictionary_dup(const struct tuple_dictionary *dict)
+{
+	return tuple_dictionary_new_impl(dict->names, 0, sizeof(char *),
+					 dict->name_count);
 }
 
 uint32_t

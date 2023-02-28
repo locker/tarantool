@@ -70,6 +70,10 @@ struct tuple_dictionary {
 struct tuple_dictionary *
 tuple_dictionary_new(const struct field_def *fields, uint32_t field_count);
 
+/** Create a copy of a tuple dictionary. Never fails. */
+struct tuple_dictionary *
+tuple_dictionary_dup(const struct tuple_dictionary *dict);
+
 /**
  * Compute a tuple dictionary hash with PMurHash32_Process and return
  * the size of data processed.

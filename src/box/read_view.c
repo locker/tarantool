@@ -15,7 +15,6 @@
 #include "box.h"
 #include "engine.h"
 #include "fiber.h"
-#include "field_def.h"
 #include "index.h"
 #include "salad/grp_alloc.h"
 #include "small/rlist.h"
@@ -25,6 +24,8 @@
 #include "tarantool_ev.h"
 #include "trivia/util.h"
 #include "tuple.h"
+#include "tuple_dictionary.h"
+#include "tuple_format.h"
 #include "vclock/vclock.h"
 
 /**
@@ -75,8 +76,8 @@ static void
 space_read_view_delete(struct space_read_view *space_rv)
 {
 	assert(space_rv->format == NULL);
-	if (space_rv->field_count > 0)
-		field_def_array_delete(space_rv->fields, space_rv->field_count);
+	if (space_rv->dict != NULL)
+		tuple_dictionary_unref(space_rv->dict);
 	for (uint32_t i = 0; i <= space_rv->index_id_max; i++) {
 		struct index_read_view *index_rv = space_rv->index_map[i];
 		if (index_rv != NULL) {
@@ -109,13 +110,14 @@ space_read_view_new(struct space *space, const struct read_view_opts *opts)
 	space_rv->id = space_id(space);
 	space_rv->group_id = space_group_id(space);
 	if (opts->enable_field_names && space->def->field_count > 0) {
-		space_rv->fields = field_def_array_dup(space->def->fields,
-						       space->def->field_count);
-		assert(space_rv->fields != NULL);
-		space_rv->field_count = space->def->field_count;
+		/*
+		 * Copy the dictionary instead of just referencing it, because
+		 * a dictionary is mutable, see tuple_dictionary_swap().
+		 */
+		space_rv->dict = tuple_dictionary_dup(space->format->dict);
+		assert(space_rv->dict != NULL);
 	} else {
-		space_rv->fields = NULL;
-		space_rv->field_count = 0;
+		space_rv->dict = NULL;
 	}
 	space_rv->format = NULL;
 	if (opts->enable_space_upgrade && space->upgrade != NULL) {
