@@ -1,6 +1,7 @@
 local buffer = require('buffer')
 local console = require('console')
 local msgpack = require('msgpack')
+local varbinary = require('varbinary')
 local ffi = require('ffi')
 local fun = require('fun')
 local t = require('luatest')
@@ -20,13 +21,13 @@ g.test_errors = function()
         function() msgpack.encode('test', buf.buf) end)
 
     t.assert_error_msg_content_equals(
-        "msgpack.decode: a Lua string or 'char *' expected",
+        "msgpack.decode: varbinary, string, or 'char *' expected",
         function() msgpack.decode() end)
     t.assert_error_msg_content_equals(
-        "msgpack.decode: a Lua string or 'char *' expected",
+        "msgpack.decode: varbinary, string, or 'char *' expected",
         function() msgpack.decode(123) end)
     t.assert_error_msg_content_equals(
-        "msgpack.decode: a Lua string or 'char *' expected",
+        "msgpack.decode: varbinary, string, or 'char *' expected",
         function() msgpack.decode(buf) end)
 
     t.assert_error_msg_content_equals(
@@ -43,13 +44,13 @@ g.test_errors = function()
         "bad argument #2 to 'decode' (number expected, got string)",
         function() msgpack.decode('test', 'offset') end)
     t.assert_error_msg_content_equals(
-        "msgpack.decode: a Lua string or 'char *' expected",
+        "msgpack.decode: varbinary, string, or 'char *' expected",
         function() msgpack.decode_unchecked() end)
     t.assert_error_msg_content_equals(
-        "msgpack.decode: a Lua string or 'char *' expected",
+        "msgpack.decode: varbinary, string, or 'char *' expected",
         function() msgpack.decode_unchecked(123) end)
     t.assert_error_msg_content_equals(
-        "msgpack.decode: a Lua string or 'char *' expected",
+        "msgpack.decode: varbinary, string, or 'char *' expected",
         function() msgpack.decode_unchecked(buf) end)
 
     t.assert_error_msg_content_equals(
@@ -66,7 +67,7 @@ g.test_errors = function()
         "msgpack.object: a Lua object expected",
         function() msgpack.object() end)
     t.assert_error_msg_content_equals(
-        "msgpack.object_from_raw: a Lua string or 'char *' expected",
+        "msgpack.object_from_raw: varbinary, string, or 'char *' expected",
         function() msgpack.object_from_raw() end)
     t.assert_error_msg_content_equals(
         "bad argument #2 to 'object_from_raw' (number expected, got string)",
@@ -547,6 +548,35 @@ g.test_object_autocomplete = function()
     rawset(_G, 'mp', msgpack.object({}))
     local r = tabcomplete('mp:')
     t.assert_equals(r, {'mp:', 'mp:get(', 'mp:decode(', 'mp:iterator('})
+end
+
+g.test_decode_varbinary = function()
+    local obj = {foo = 'bar'}
+    local data = varbinary.new(msgpack.encode({foo = 'bar'}))
+
+    t.assert_equals(msgpack.object_from_raw(data):decode(), obj)
+
+    t.assert_error_msg_content_equals(
+        'msgpack.decode: offset is out of bounds',
+        msgpack.decode, data, 0)
+    t.assert_error_msg_content_equals(
+        'msgpack.decode: offset is out of bounds',
+        msgpack.decode, data, #data + 1)
+    t.assert_equals({msgpack.decode(data)}, {obj, #data + 1})
+    t.assert_equals({msgpack.decode(data, 1)}, {obj, #data + 1})
+    t.assert_equals({msgpack.decode(data, 2)}, {'foo', 6})
+    t.assert_equals({msgpack.decode(data, 6)}, {'bar', #data + 1})
+
+    t.assert_error_msg_content_equals(
+        'msgpack.decode: offset is out of bounds',
+        msgpack.decode_unchecked, data, 0)
+    t.assert_error_msg_content_equals(
+        'msgpack.decode: offset is out of bounds',
+        msgpack.decode_unchecked, data, #data + 1)
+    t.assert_equals({msgpack.decode_unchecked(data)}, {obj, #data + 1})
+    t.assert_equals({msgpack.decode_unchecked(data, 1)}, {obj, #data + 1})
+    t.assert_equals({msgpack.decode_unchecked(data, 2)}, {'foo', 6})
+    t.assert_equals({msgpack.decode_unchecked(data, 6)}, {'bar', #data + 1})
 end
 
 local g_error_details_params = {

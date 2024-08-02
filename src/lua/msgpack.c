@@ -576,41 +576,40 @@ lua_msgpack_encode(lua_State *L)
 }
 
 static int
-lua_msgpack_decode_cdata(lua_State *L, bool check)
+lua_msgpack_decode_impl(lua_State *L, bool check)
 {
 	const char *data;
-	uint32_t cdata_type;
-	if (luaL_checkconstchar(L, 1, &data, &cdata_type) != 0) {
-		return luaL_error(L, "msgpack.decode: "
-				  "a Lua string or 'char *' expected");
-	}
-	if (check) {
-		ptrdiff_t data_len = luaL_checkinteger(L, 2);
-		if (data_len < 0) {
-			return luaL_error(L, "msgpack.decode: size can't be "\
-					  "negative");
-		}
-		const char *p = data;
-		if (mp_check(&p, data + data_len) != 0)
-			return luaT_error(L);
-	}
-	struct luaL_serializer *cfg = luaL_checkserializer(L);
-	luamp_decode(L, cfg, &data);
-	*(const char **)luaL_pushcdata(L, cdata_type) = data;
-	return 2;
-}
-
-static int
-lua_msgpack_decode_string(lua_State *L, bool check)
-{
+	size_t data_len = 0;
 	ptrdiff_t offset = 0;
-	size_t data_len;
-	const char *data = lua_tolstring(L, 1, &data_len);
-	if (lua_gettop(L) > 1) {
-		offset = luaL_checkinteger(L, 2) - 1;
-		if (offset < 0 || (size_t)offset >= data_len)
-			return luaL_error(L, "msgpack.decode: "
-					  "offset is out of bounds");
+	bool push_ptr = false;
+	uint32_t cdata_type = 0;
+	if (luaL_checkconstchar(L, 1, &data, &cdata_type) == 0) {
+		push_ptr = true;
+		if (check) {
+			ptrdiff_t len = luaL_checkinteger(L, 2);
+			if (len < 0)
+				return luaL_error(L, "msgpack.decode: "
+						  "size can't be negative");
+			data_len = len;
+		}
+	} else {
+		if (lua_type(L, 1) == LUA_TSTRING) {
+			data = lua_tolstring(L, 1, &data_len);
+		} else {
+			uint32_t len = 0;
+			data = luaT_tovarbinary(L, 1, &len);
+			if (data == NULL)
+				return luaL_error(L, "msgpack.decode: "
+						  "varbinary, string, or "
+						  "'char *' expected");
+			data_len = len;
+		}
+		if (lua_gettop(L) > 1) {
+			offset = luaL_checkinteger(L, 2) - 1;
+			if (offset < 0 || (size_t)offset >= data_len)
+				return luaL_error(L, "msgpack.decode: "
+						  "offset is out of bounds");
+		}
 	}
 	if (check) {
 		const char *p = data + offset;
@@ -620,40 +619,24 @@ lua_msgpack_decode_string(lua_State *L, bool check)
 	struct luaL_serializer *cfg = luaL_checkserializer(L);
 	const char *p = data + offset;
 	luamp_decode(L, cfg, &p);
-	lua_pushinteger(L, p - data + 1);
+	if (push_ptr) {
+		*(const char **)luaL_pushcdata(L, cdata_type) = p;
+	} else {
+		lua_pushinteger(L, p - data + 1);
+	}
 	return 2;
 }
 
 static int
 lua_msgpack_decode(lua_State *L)
 {
-	int index = lua_gettop(L);
-	int type = index >= 1 ? lua_type(L, 1) : LUA_TNONE;
-	switch (type) {
-	case LUA_TCDATA:
-		return lua_msgpack_decode_cdata(L, true);
-	case LUA_TSTRING:
-		return lua_msgpack_decode_string(L, true);
-	default:
-		return luaL_error(L, "msgpack.decode: "
-				  "a Lua string or 'char *' expected");
-	}
+	return lua_msgpack_decode_impl(L, true);
 }
 
 static int
 lua_msgpack_decode_unchecked(lua_State *L)
 {
-	int index = lua_gettop(L);
-	int type = index >= 1 ? lua_type(L, 1) : LUA_TNONE;
-	switch (type) {
-	case LUA_TCDATA:
-		return lua_msgpack_decode_cdata(L, false);
-	case LUA_TSTRING:
-		return lua_msgpack_decode_string(L, false);
-	default:
-		return luaL_error(L, "msgpack.decode: "
-				  "a Lua string or 'char *' expected");
-	}
+	return lua_msgpack_decode_impl(L, false);
 }
 
 static int
@@ -818,20 +801,27 @@ lua_msgpack_object(struct lua_State *L)
 
 /**
  * Creates a new msgpack object from raw data and pushes it to Lua stack.
- * The data is given either by a Lua string or by a char ptr and size.
+ * The data is given by varbiary, string, or char ptr and size.
  */
 static int
 lua_msgpack_object_from_raw(struct lua_State *L)
 {
 	const char *data;
 	size_t data_len;
-	uint32_t cdata_type;
 	switch (lua_type(L, 1)) {
-	case LUA_TCDATA:
-		if (luaL_checkconstchar(L, 1, &data, &cdata_type) != 0)
+	case LUA_TCDATA: {
+		uint32_t len;
+		uint32_t cdata_type;
+		data = luaT_tovarbinary(L, 1, &len);
+		if (data != NULL) {
+			data_len = len;
+		} else if (luaL_checkconstchar(L, 1, &data, &cdata_type) == 0) {
+			data_len = luaL_checkinteger(L, 2);
+		} else {
 			goto error;
-		data_len = luaL_checkinteger(L, 2);
+		}
 		break;
+	}
 	case LUA_TSTRING:
 		data = lua_tolstring(L, 1, &data_len);
 		break;
@@ -850,7 +840,7 @@ lua_msgpack_object_from_raw(struct lua_State *L)
 	return 1;
 error:
 	return luaL_error(L, "msgpack.object_from_raw: "
-			  "a Lua string or 'char *' expected");
+			  "varbinary, string, or 'char *' expected");
 }
 
 /**
