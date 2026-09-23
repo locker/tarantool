@@ -335,10 +335,24 @@ static struct tuple *
 memtx_space_prepare_index_tuple(struct tuple_format *format,
 				struct tuple *tuple)
 {
-	if (format->is_compressed)
-		return memtx_tuple_compress(tuple);
-	else
-		return tuple;
+	tuple_ref(tuple);
+	if (format->is_compressed) {
+		struct tuple *new_tuple = memtx_tuple_compress(tuple);
+		tuple_unref(tuple);
+		if (new_tuple == NULL)
+			return NULL;
+		tuple_ref(new_tuple);
+		tuple = new_tuple;
+	}
+	if (tuple_has_flag(tuple, TUPLE_IS_BIG)) {
+		struct tuple *new_tuple = memtx_tuple_split(tuple);
+		tuple_unref(tuple);
+		if (new_tuple == NULL)
+			return NULL;
+		tuple_ref(new_tuple);
+		tuple = new_tuple;
+	}
+	return tuple;
 }
 
 /**
@@ -400,7 +414,6 @@ memtx_space_execute_replace(struct space *space, struct txn *txn,
 						space->format, new_tuple);
 	if (new_index_tuple == NULL)
 		return -1;
-	tuple_ref(new_index_tuple);
 	struct tuple *old_index_tuple;
 	if (memtx_space->replace(space, NULL, new_index_tuple,
 				 dup_replace_mode(request->type),
@@ -516,7 +529,6 @@ memtx_space_execute_update(struct space *space, struct txn *txn,
 						format, new_tuple);
 	if (new_index_tuple == NULL)
 		return -1;
-	tuple_ref(new_index_tuple);
 	struct tuple *deleted;
 	if (memtx_space->replace(space, old_index_tuple, new_index_tuple,
 				 DUP_REPLACE, &deleted) != 0) {
@@ -664,7 +676,6 @@ memtx_space_execute_upsert(struct space *space, struct txn *txn,
 						format, new_tuple);
 	if (new_index_tuple == NULL)
 		return -1;
-	tuple_ref(new_index_tuple);
 	/*
 	 * It's OK to use DUP_REPLACE_OR_INSERT: we don't risk
 	 * inserting a new tuple if the old one exists, since
@@ -848,7 +859,6 @@ memtx_space_recover_snapshot_row(struct space *space, struct request *request)
 						space->format, new_tuple);
 	if (new_index_tuple == NULL)
 		goto out;
-	tuple_ref(new_index_tuple);
 	struct tuple *old_index_tuple;
 	if (memtx_space_replace_build_next(space, /*old_tuple=*/NULL,
 					   new_index_tuple, DUP_INSERT,

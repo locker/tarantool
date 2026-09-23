@@ -127,6 +127,7 @@ private:
 					   /*dontdump=*/true,
 					   memtx_granularity, "small",
 					   memtx_alloc_factor,
+					   /*tuple_chunk_size=*/SIZE_MAX,
 					   /*threads_num=*/0,
 					   memtx_on_indexes_built_mock_cb);
 		if (memtx == nullptr)

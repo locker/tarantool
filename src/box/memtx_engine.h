@@ -146,6 +146,8 @@ struct memtx_engine {
 	struct matras_stats index_extent_stats;
 	/** Maximal allowed tuple size, box.cfg.memtx_max_tuple_size. */
 	size_t max_tuple_size;
+	/** Target size of a tuple chunk, box.cfg.memtx_tuple_chunk_size. */
+	size_t tuple_chunk_size;
 	/** Memory pool for rtree index iterator. */
 	struct mempool rtree_iterator_pool;
 	/**
@@ -320,7 +322,8 @@ struct memtx_engine *
 memtx_engine_new(const char *snap_dirname, bool force_recovery,
 		 uint64_t tuple_arena_max_size, uint32_t objsize_min,
 		 bool dontdump, unsigned granularity,
-		 const char *allocator, float alloc_factor, int threads_num,
+		 const char *allocator, float alloc_factor,
+		 size_t tuple_chunk_size, int sort_threads,
 		 memtx_on_indexes_built_cb on_indexes_built);
 
 /**
@@ -372,6 +375,11 @@ enum {
 	MEMTX_TUPLE_NEW_RAW_NO_VALIDATE = 1 << 0,
 	/** This flag allows to bypass tuple max size limitation. */
 	MEMTX_TUPLE_NEW_RAW_NO_TUPLE_MAX_SIZE = 1 << 1,
+	/**
+	 * Set this flag if the tuple data is split into chunks that must be
+	 * relocated on memtx arena.
+	 */
+	MEMTX_TUPLE_NEW_RAW_CHUNKED = 1 << 2,
 };
 
 /**
@@ -381,6 +389,25 @@ enum {
 extern struct tuple *
 (*memtx_tuple_new_raw)(struct tuple_format *format, const char *data,
 		       const char *end, unsigned flags);
+
+/**
+ * Allocate a new tuple with big fields are split into chunks.
+ */
+struct tuple *
+memtx_tuple_split(struct tuple *tuple);
+
+/**
+ * Same as memtx_tuple_merge() but for raw tuple data.
+ * The result is allocated from the fiber region.
+ */
+const char *
+memtx_tuple_merge_raw(const char *data, const char *data_end, uint32_t *p_size);
+
+/**
+ * Allocate a new tuple with split fields merged into continuous blocks.
+ */
+struct tuple *
+memtx_tuple_merge(struct tuple *tuple);
 
 /** Check if the given index definition support the MemTX sort data. */
 bool
@@ -468,14 +495,15 @@ memtx_engine_new_xc(const char *snap_dirname, bool force_recovery,
 		    uint64_t tuple_arena_max_size, uint32_t objsize_min,
 		    bool dontdump, unsigned granularity,
 		    const char *allocator, float alloc_factor,
-		    int sort_threads,
+		    size_t tuple_chunk_size, int sort_threads,
 		    memtx_on_indexes_built_cb on_indexes_built)
 {
 	struct memtx_engine *memtx;
 	memtx = memtx_engine_new(snap_dirname, force_recovery,
 				 tuple_arena_max_size, objsize_min, dontdump,
 				 granularity, allocator, alloc_factor,
-				 sort_threads, on_indexes_built);
+				 tuple_chunk_size, sort_threads,
+				 on_indexes_built);
 	if (memtx == NULL)
 		diag_raise();
 	return memtx;

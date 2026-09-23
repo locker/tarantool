@@ -67,6 +67,8 @@
 #include "assoc.h"
 #include "scoped_guard.h"
 #include "xlog_reader.h"
+#include "mpstream/mpstream.h"
+#include "small/region.h"
 
 #include <type_traits>
 
@@ -1926,20 +1928,27 @@ memtx_set_tuple_format_vtab(const char *allocator_name)
 int
 memtx_tuple_validate(struct tuple_format *format, struct tuple *tuple)
 {
-	tuple = memtx_tuple_decompress(tuple);
-	if (tuple == NULL)
-		return -1;
-	tuple_ref(tuple);
-	int rc = tuple_validate_raw(format, tuple_data(tuple));
-	tuple_unref(tuple);
-	return rc;
+	if (tuple_has_flag(tuple, TUPLE_IS_CHUNKED)) {
+		tuple = memtx_tuple_merge(tuple);
+		if (tuple == NULL)
+			return -1;
+		tuple_bless(tuple);
+	}
+	if (tuple_is_compressed(tuple)) {
+		tuple = memtx_tuple_decompress(tuple);
+		if (tuple == NULL)
+			return -1;
+		tuple_bless(tuple);
+	}
+	return tuple_validate(format, tuple);
 }
 
 struct memtx_engine *
 memtx_engine_new(const char *snap_dirname, bool force_recovery,
 		 uint64_t tuple_arena_max_size, uint32_t objsize_min,
 		 bool dontdump, unsigned granularity,
-		 const char *allocator, float alloc_factor, int sort_threads,
+		 const char *allocator, float alloc_factor,
+		 size_t tuple_chunk_size, int sort_threads,
 		 memtx_on_indexes_built_cb on_indexes_built)
 {
 	int64_t snap_signature;
@@ -2070,6 +2079,7 @@ memtx_engine_new(const char *snap_dirname, bool force_recovery,
 
 	memtx->state = MEMTX_INITIALIZED;
 	memtx->max_tuple_size = MAX_TUPLE_SIZE;
+	memtx->tuple_chunk_size = tuple_chunk_size;
 	memtx->force_recovery = force_recovery;
 	if (sort_threads == 0) {
 		char *ompnum_str = getenv_safe("OMP_NUM_THREADS", NULL, 0);
@@ -2271,6 +2281,296 @@ memtx_engine_set_max_tuple_size(struct memtx_engine *memtx, size_t max_size)
 	memtx->max_tuple_size = max_size;
 }
 
+/**
+ * Split a tuple field into chunks and dump the result to the stream.
+ *
+ * The result is wrapped into a MsgPack Extension of type MP_COMPRESSED_DATA
+ * that contains pointers to chunk boundaries:
+ *
+ *   [begin1, end1, begin2, end2, ...]
+ *
+ * Chunks are not relocated.
+ */
+static void
+memtx_split_field(const char *field_data, size_t field_size, size_t chunk_size,
+		  struct mpstream *stream)
+{
+	static int chunks_capacity;
+	static const char **chunks;
+	int max_chunk_count = DIV_ROUND_UP(field_size, chunk_size);
+	if (max_chunk_count > chunks_capacity) {
+		chunks_capacity = MAX(max_chunk_count, chunks_capacity * 2);
+		chunks = (const char **)xrealloc(
+			chunks, chunks_capacity * sizeof(*chunks));
+	}
+	int chunk_count;
+	const char *field_end = field_data;
+	mp_split(&field_end, chunk_size, max_chunk_count,
+		 &chunk_count, chunks);
+	assert(field_end == field_data + field_size);
+	assert(chunk_count > 0 && chunk_count <= max_chunk_count);
+	uint32_t ext_len = sizeof(void *) * chunk_count * 2;
+	uint32_t new_field_size = mp_sizeof_ext(ext_len);
+	char *new_field = mpstream_reserve(stream, new_field_size);
+	char *p = new_field;
+	p = mp_encode_extl(p, MP_CHUNKED_DATA, ext_len);
+	for (int i = 0; i < chunk_count; i++) {
+		const char *chunk_begin = chunks[i];
+		const char *chunk_end = (i + 1 < chunk_count ?
+					 chunks[i + 1] : field_end);
+		p = mp_memcpy(p, (char *)&chunk_begin, sizeof(chunk_begin));
+		p = mp_memcpy(p, (char *)&chunk_end, sizeof(chunk_end));
+	}
+	assert(p == new_field + new_field_size);
+	mpstream_advance(stream, new_field_size);
+}
+
+struct tuple *
+memtx_tuple_split(struct tuple *tuple)
+{
+	struct tuple_format *format = tuple_format(tuple);
+	struct memtx_engine *memtx = (struct memtx_engine *)format->engine;
+	size_t chunk_size = memtx->tuple_chunk_size;
+	struct region *region = &fiber()->gc;
+	size_t region_svp = region_used(region);
+	struct mpstream stream;
+	mpstream_init(&stream, region, region_reserve_cb, region_alloc_cb,
+		      mpstream_panic_cb, NULL);
+	const char *p = tuple_data(tuple);
+	uint32_t field_count = mp_decode_array(&p);
+	mpstream_encode_array(&stream, field_count);
+	for (uint32_t i = 0; i < field_count; i++) {
+		struct tuple_field *field =
+			i < tuple_format_field_count(format) ?
+			tuple_format_field(format, i) : NULL;
+		const char *field_data = p;
+		mp_next(&p);
+		size_t field_size = p - field_data;
+		if (field_size >= chunk_size &&
+		    (field == NULL || !field->is_key_part) &&
+		    (mp_typeof(*field_data) == MP_ARRAY ||
+		     mp_typeof(*field_data) == MP_MAP)) {
+			memtx_split_field(field_data, field_size, chunk_size,
+					  &stream);
+		} else {
+			mpstream_memcpy(&stream, field_data, field_size);
+		}
+	}
+	mpstream_flush(&stream);
+	size_t new_size = region_used(region) - region_svp;
+	char *new_data = (char *)xregion_join(region, new_size);
+	struct tuple *new_tuple = memtx_tuple_new_raw(
+		format, new_data, new_data + new_size,
+		MEMTX_TUPLE_NEW_RAW_NO_VALIDATE |
+		MEMTX_TUPLE_NEW_RAW_CHUNKED);
+	region_truncate(region, region_svp);
+	return new_tuple;
+}
+
+const char *
+memtx_tuple_merge_raw(const char *data, const char *data_end, uint32_t *p_size)
+{
+	struct region *region = &fiber()->gc;
+	size_t region_svp = region_used(region);
+	struct mpstream stream;
+	mpstream_init(&stream, region, region_reserve_cb, region_alloc_cb,
+		      mpstream_panic_cb, NULL);
+	const char *p = data;
+	uint32_t field_count = mp_decode_array(&p);
+	mpstream_encode_array(&stream, field_count);
+	for (uint32_t i = 0; i < field_count; i++) {
+		const char *field_data = p;
+		if (mp_typeof(*p) != MP_EXT) {
+			mp_next(&p);
+			mpstream_memcpy(&stream, field_data, p - field_data);
+			continue;
+		}
+		int8_t ext_type;
+		uint32_t ext_len;
+		const char *ext_data = mp_decode_ext(&p, &ext_type, &ext_len);
+		if (ext_type != MP_CHUNKED_DATA) {
+			mpstream_memcpy(&stream, field_data, p - field_data);
+			continue;
+		}
+		int chunk_count = ext_len / sizeof(void *) / 2;
+		assert(ext_len == chunk_count * sizeof(void *) * 2);
+		for (int j = 0; j < chunk_count; j++) {
+			char **p_chunk_begin = (char **)ext_data + j * 2;
+			char **p_chunk_end = (char **)ext_data + j * 2 + 1;
+			void *chunk_ptr;
+			memcpy(&chunk_ptr, p_chunk_begin, sizeof(chunk_ptr));
+			uint32_t chunk_size = *p_chunk_end - *p_chunk_begin;
+			mpstream_memcpy(&stream, chunk_ptr, chunk_size);
+		}
+	}
+	assert(p == data_end);
+	(void)data_end;
+	mpstream_flush(&stream);
+	*p_size = region_used(region) - region_svp;
+	return (const char *)xregion_join(region, *p_size);
+}
+
+struct tuple *
+memtx_tuple_merge(struct tuple *tuple)
+{
+	struct region *region = &fiber()->gc;
+	size_t region_svp = region_used(region);
+	uint32_t size;
+	const char *data = tuple_data_range(tuple, &size);
+	uint32_t new_size;
+	const char *new_data = memtx_tuple_merge_raw(
+		data, data + size, &new_size);
+	struct tuple *new_tuple = memtx_tuple_new_raw(
+		tuple_format(tuple), new_data, new_data + new_size,
+		MEMTX_TUPLE_NEW_RAW_NO_VALIDATE);
+	region_truncate(region, region_svp);
+	return new_tuple;
+}
+
+/**
+ * Allocate a new memory block for a memtx tuple.
+ */
+template<class ALLOC>
+static struct memtx_block *
+memtx_alloc_block(struct memtx_engine *memtx, uint32_t data_size,
+		  uint16_t data_offset, bool make_compact)
+{
+	struct memtx_block *block;
+	while ((block = MemtxAllocator<ALLOC>::alloc(data_size, data_offset,
+						     make_compact)) == NULL) {
+		bool stop;
+		memtx_engine_run_gc(memtx, &stop);
+		if (stop)
+			break;
+	}
+	if (block == NULL)
+		diag_set(OutOfMemory, data_size + data_offset,
+			 "slab allocator", "memtx_tuple");
+	return block;
+}
+
+/**
+ * Free memtx blocks stored in MP_COMPRESSED_DATA fields.
+ */
+template<class ALLOC>
+static void
+memtx_tuple_free_chunks_raw(const char *field_data, uint32_t field_count,
+			    bool is_temporary)
+{
+	const char *p = field_data;
+	for (uint32_t i = 0; i < field_count; i++) {
+		if (mp_typeof(*p) != MP_EXT) {
+			mp_next(&p);
+			continue;
+		}
+		int8_t ext_type;
+		uint32_t ext_len;
+		const char *ext_data = mp_decode_ext(&p, &ext_type, &ext_len);
+		if (ext_type != MP_CHUNKED_DATA)
+			continue;
+		int chunk_count = ext_len / sizeof(void *) / 2;
+		assert(ext_len == chunk_count * sizeof(void *) * 2);
+		for (int j = 0; j < chunk_count; j++) {
+			char **p_chunk_begin = (char **)ext_data + j * 2;
+			char **p_chunk_end = (char **)ext_data + j * 2 + 1;
+			void *chunk_ptr;
+			memcpy(&chunk_ptr, p_chunk_begin, sizeof(chunk_ptr));
+			struct memtx_block *block =
+				(struct memtx_block *)chunk_ptr - 1;
+			assert(memtx_block_data(block) == chunk_ptr);
+			MemtxAllocator<ALLOC>::free(block, is_temporary);
+			void *null_ptr = NULL;
+			memcpy(p_chunk_begin, &null_ptr, sizeof(null_ptr));
+			memcpy(p_chunk_end, &null_ptr, sizeof(null_ptr));
+		}
+	}
+}
+
+/**
+ * Allocate chunks stored in MP_COMPRESSED_DATA fields from memtx arena.
+ */
+template<class ALLOC>
+static int
+memtx_tuple_alloc_chunks(struct tuple *tuple)
+{
+	assert(!tuple_has_flag(tuple, TUPLE_IS_CHUNKED));
+	struct tuple_format *format = tuple_format(tuple);
+	struct memtx_engine *memtx = (struct memtx_engine *)format->engine;
+	bool is_temporary = tuple_has_flag(tuple, TUPLE_IS_TEMPORARY);
+	const char *field_data = tuple_data(tuple);
+	uint32_t field_count = mp_decode_array(&field_data);
+	const char *p = field_data;
+	for (uint32_t i = 0; i < field_count; i++) {
+		if (mp_typeof(*p) != MP_EXT) {
+			mp_next(&p);
+			continue;
+		}
+		int8_t ext_type;
+		uint32_t ext_len;
+		const char *ext_data = mp_decode_ext(&p, &ext_type, &ext_len);
+		if (ext_type != MP_CHUNKED_DATA)
+			continue;
+		int chunk_count = ext_len / sizeof(void *) / 2;
+		assert(ext_len == chunk_count * sizeof(void *) * 2);
+		/* Allocate a block for each chunk. */
+		struct region *region = &fiber()->gc;
+		size_t region_svp = region_used(region);
+		struct memtx_block **blocks = xregion_alloc_array(
+				region, typeof(blocks[0]), chunk_count);
+		for (int j = 0; j < chunk_count; j++) {
+			char **p_chunk_begin = (char **)ext_data + j * 2;
+			char **p_chunk_end = (char **)ext_data + j * 2 + 1;
+			uint32_t chunk_size = *p_chunk_end - *p_chunk_begin;
+			blocks[j] = memtx_alloc_block<ALLOC>(
+				memtx, chunk_size,
+				/*data_offset=*/sizeof(memtx_block::header),
+				/*make_compact=*/false);
+			if (blocks[j] == NULL) {
+				for (int k = j - 1; k >= 0; k--) {
+					MemtxAllocator<ALLOC>::free(
+						blocks[k], is_temporary);
+				}
+				region_truncate(region, region_svp);
+				memtx_tuple_free_chunks_raw<ALLOC>(
+					field_data, i, is_temporary);
+				return -1;
+			}
+		}
+		/* Replace chunk pointers with pointers to allocated blocks. */
+		for (int j = 0; j < chunk_count; j++) {
+			char **p_chunk_begin = (char **)ext_data + j * 2;
+			char **p_chunk_end = (char **)ext_data + j * 2 + 1;
+			uint32_t chunk_size = *p_chunk_end - *p_chunk_begin;
+			char *new_chunk_begin =
+				(char *)memtx_block_data(blocks[j]);
+			char *new_chunk_end = new_chunk_begin + chunk_size;
+			memcpy(new_chunk_begin, *p_chunk_begin, chunk_size);
+			memcpy(p_chunk_begin, &new_chunk_begin,
+			       sizeof(new_chunk_begin));
+			memcpy(p_chunk_end, &new_chunk_end,
+			       sizeof(new_chunk_end));
+		}
+		region_truncate(region, region_svp);
+	}
+	tuple_set_flag(tuple, TUPLE_IS_CHUNKED);
+	return 0;
+}
+
+/**
+ * Free memtx blocks stored in MP_COMPRESSED_DATA fields.
+ */
+template<class ALLOC>
+static void
+memtx_tuple_free_chunks(struct tuple *tuple)
+{
+	assert(tuple_has_flag(tuple, TUPLE_IS_CHUNKED));
+	bool is_temporary = tuple_has_flag(tuple, TUPLE_IS_TEMPORARY);
+	const char *field_data = tuple_data(tuple);
+	uint32_t field_count = mp_decode_array(&field_data);
+	memtx_tuple_free_chunks_raw<ALLOC>(field_data, field_count,
+					   is_temporary);
+}
+
 template<class ALLOC>
 static struct tuple *
 memtx_tuple_new_raw_impl(struct tuple_format *format, const char *data,
@@ -2278,7 +2578,6 @@ memtx_tuple_new_raw_impl(struct tuple_format *format, const char *data,
 {
 	struct memtx_engine *memtx = (struct memtx_engine *)format->engine;
 	assert(mp_typeof(*data) == MP_ARRAY);
-	struct memtx_block *block;
 	struct tuple *tuple = NULL;
 	struct region *region = &fiber()->gc;
 	size_t region_svp = region_used(region);
@@ -2289,6 +2588,7 @@ memtx_tuple_new_raw_impl(struct tuple_format *format, const char *data,
 	bool make_compact;
 	bool validate = (flags & MEMTX_TUPLE_NEW_RAW_NO_VALIDATE) == 0;
 	bool limit_size = (flags & MEMTX_TUPLE_NEW_RAW_NO_TUPLE_MAX_SIZE) == 0;
+	bool is_chunked = (flags & MEMTX_TUPLE_NEW_RAW_CHUNKED) != 0;
 	if (tuple_field_map_create(format, data, validate, &builder) != 0)
 		goto end;
 	field_map_size = field_map_build_size(&builder);
@@ -2321,26 +2621,31 @@ memtx_tuple_new_raw_impl(struct tuple_format *format, const char *data,
 		goto end;
 	}
 
-	while ((block = MemtxAllocator<ALLOC>::alloc(tuple_len, data_offset,
-						     make_compact)) == NULL) {
-		bool stop;
-		memtx_engine_run_gc(memtx, &stop);
-		if (stop)
-			break;
+	if (!is_chunked && total >= memtx->tuple_chunk_size) {
+		tuple = (struct tuple *)runtime_memory_alloc(total);
+		if (tuple == NULL)
+			goto end;
+		tuple_create(tuple, 0, tuple_format_id(format),
+			     data_offset, tuple_len, make_compact);
+		tuple_set_flag(tuple, TUPLE_IS_BIG);
+	} else {
+		struct memtx_block *block = memtx_alloc_block<ALLOC>(
+				memtx, tuple_len, data_offset, make_compact);
+		if (block == NULL)
+			goto end;
+		tuple = memtx_block_to_tuple(block);
+		tuple_create_base(tuple, 0, tuple_format_id(format));
+		if (format->is_temporary)
+			tuple_set_flag(tuple, TUPLE_IS_TEMPORARY);
 	}
-	if (block == NULL) {
-		diag_set(OutOfMemory, total, "slab allocator", "memtx_tuple");
-		goto end;
-	}
-
-	tuple = memtx_block_to_tuple(block);
-	tuple_create_base(tuple, 0, tuple_format_id(format));
-	if (format->is_temporary)
-		tuple_set_flag(tuple, TUPLE_IS_TEMPORARY);
 	tuple_format_ref(format);
 	raw = (char *) tuple + data_offset;
 	field_map_build(&builder, raw - field_map_size);
 	memcpy(raw, data, tuple_len);
+	if (is_chunked && memtx_tuple_alloc_chunks<ALLOC>(tuple) != 0) {
+		tuple_delete(tuple);
+		tuple = NULL;
+	}
 end:
 	region_truncate(region, region_svp);
 	return tuple;
@@ -2358,9 +2663,16 @@ static void
 memtx_tuple_delete(struct tuple_format *format, struct tuple *tuple)
 {
 	assert(tuple_is_unreferenced(tuple));
-	struct memtx_block *block = memtx_block_from_tuple(tuple);
-	bool is_temporary = tuple_has_flag(tuple, TUPLE_IS_TEMPORARY);
-	MemtxAllocator<ALLOC>::free(block, is_temporary);
+	if (tuple_has_flag(tuple, TUPLE_IS_BIG)) {
+		assert(!tuple_has_flag(tuple, TUPLE_IS_CHUNKED));
+		runtime_memory_free(tuple, tuple_size(tuple));
+	} else {
+		if (tuple_has_flag(tuple, TUPLE_IS_CHUNKED))
+			memtx_tuple_free_chunks<ALLOC>(tuple);
+		struct memtx_block *block = memtx_block_from_tuple(tuple);
+		bool is_temporary = tuple_has_flag(tuple, TUPLE_IS_TEMPORARY);
+		MemtxAllocator<ALLOC>::free(block, is_temporary);
+	}
 	tuple_format_unref(format);
 }
 
@@ -2540,10 +2852,18 @@ int
 memtx_prepare_result_tuple(struct space *space, struct tuple **result)
 {
 	if (*result != NULL) {
-		*result = memtx_tuple_decompress(*result);
-		if (*result == NULL)
-			return -1;
-		tuple_bless(*result);
+		if (tuple_has_flag(*result, TUPLE_IS_CHUNKED)) {
+			*result = memtx_tuple_merge(*result);
+			if (*result == NULL)
+				return -1;
+			tuple_bless(*result);
+		}
+		if (tuple_is_compressed(*result)) {
+			*result = memtx_tuple_decompress(*result);
+			if (*result == NULL)
+				return -1;
+			tuple_bless(*result);
+		}
 		if (unlikely(space != NULL && space->upgrade != NULL)) {
 			*result = space_upgrade_apply(space->upgrade, *result);
 			if (*result == NULL)
@@ -2570,6 +2890,10 @@ memtx_prepare_read_view_tuple(struct tuple *tuple,
 	result->data = tuple_data_range(tuple, &result->size);
 	result->ptr = tuple;
 	if (!index->space->rv->disable_decompression) {
+		result->data = memtx_tuple_merge_raw(
+				result->data, result->data + result->size,
+				&result->size);
+		assert(result->data != NULL);
 		result->data = memtx_tuple_decompress_raw(
 				result->data, result->data + result->size,
 				&result->size);

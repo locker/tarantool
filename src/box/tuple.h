@@ -410,6 +410,15 @@ enum tuple_flag {
 	 * immediately while a snapshot is in progress.
 	 */
 	TUPLE_IS_TEMPORARY = 2,
+	/**
+	 * Set if the tuple is too big to be allocated from memtx arena and
+	 * needs to be split into chunks first.
+	 */
+	TUPLE_IS_BIG = 3,
+	/**
+	 * Set if the tuple is split into chunks allocated from memtx arena.
+	 */
+	TUPLE_IS_CHUNKED = 4,
 	tuple_flag_MAX,
 };
 

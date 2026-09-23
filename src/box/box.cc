@@ -5229,6 +5229,7 @@ engine_init()
 				    cfg_geti("slab_alloc_granularity"),
 				    cfg_gets("memtx_allocator"),
 				    cfg_getd("slab_alloc_factor"),
+				    cfg_geti("memtx_tuple_chunk_size"),
 				    cfg_geti("memtx_sort_threads"),
 				    box_on_indexes_built);
 	engine_register((struct engine *)memtx);
